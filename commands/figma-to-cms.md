@@ -13,13 +13,34 @@ If write access isn't available, skip step 7 (annotations) and output the schema
 
 ## 1. Read the design
 
-The user provides a Figma URL. Extract `fileKey` and `nodeId` from it:
+The user provides one or more Figma URLs. Extract `fileKey` and `nodeId` from each:
 - `figma.com/design/:fileKey/:name?node-id=X-Y` → fileKey, nodeId = `X:Y`
 - Branch URLs: `figma.com/design/:fileKey/branch/:branchKey/...` → use branchKey
 
-Fetch in parallel:
-1. **Node tree** — the frame's structure, properties, text content, fills, layout
-2. **Screenshot** — visual reference of the frame
+### Multiple frames
+
+When the user provides 2+ frames, determine the relationship before analyzing:
+
+| Relationship | How to detect | Action |
+|---|---|---|
+| **Same page, different breakpoints** (desktop + mobile) | Same content, different layout/dimensions | Analyze as **one schema**. The content is identical — only the layout differs. Use the larger frame as the primary source for content classification. Compare both to detect responsive-specific differences (e.g., mobile hides a section, truncates text, swaps image ratio). Flag differences but don't duplicate fields. |
+| **Same page, different states** (default + hover, empty + filled) | Same structure, visual variations | Analyze as **one schema**. States are a code concern, not CMS content. Note state differences for the developer, not the editor. |
+| **Different pages** (homepage + blog) | Different content entirely | Analyze as **separate schemas**. Each frame gets its own document type. Look for shared referenced documents across pages (e.g., both reference a Post document). |
+
+For desktop/mobile pairs:
+- Derive constraints from the **tightest** breakpoint — if mobile truncates a heading, that's the real character limit
+- If mobile drops a section entirely, flag whether the field should be optional or if it's always required but hidden by code
+- Image ratios may differ per breakpoint — note both: `desktop 16:9, mobile 1:1`
+
+### Token-efficient fetching
+
+Figma responses can be very large. Minimize calls and avoid redundant fetches:
+
+1. **Single `get_design_context` call** on the target frame — this returns the node tree + screenshot in one call. Do NOT call `get_screenshot` separately if `get_design_context` already includes it.
+2. **One `get_metadata` call on the page** (for neighbor scanning in step 7) — fetch this in parallel with `get_design_context`, not sequentially.
+3. **One `use_figma` call to check page siblings** — combine neighbor scanning with page resolution in a single script.
+4. **Never re-fetch data you already have.** The initial `get_design_context` response contains all node dimensions, text content, fills, and positions needed for classification, constraints, and schema. Extract everything from that single response.
+5. **Never drill into decorative subtrees.** Once a group is classified as decorative from the screenshot, do not call `get_design_context` on its children.
 
 **Guard:** If the node tree is empty or errors, stop and ask the user to check the URL.
 
@@ -64,6 +85,17 @@ Classify by **position, size, and layering** — not by name.
 
 **Always flag:** hero images, section backgrounds with specific subjects, logos on partner pages.
 
+### Record content metadata
+
+While classifying, collect metadata from content elements for constraint derivation later:
+
+- **Images** — record node width × height → aspect ratio and minimum recommended size
+- **Text** — record container width, font size, line count → approximate character limit
+- **Truncated text** (ellipsis, "…", or `textTruncation` set) → hard max length
+- **Repeated items** — count visible instances → suggested min/max for arrays
+
+This costs nothing — the data is already in the node tree. It feeds into constraints in step 5.
+
 ## 4. Identify blocks
 
 Group into: page-level fields, section blocks, nested objects, references.
@@ -103,21 +135,51 @@ Platform-agnostic format:
 
 ```
 Document: pageName
-  title: string (required)
+  title: string (required, ~60 chars)
   slug: slug (from title)
-  seo: object { metaTitle: string, metaDescription: text, ogImage: image }
+  seo: object { metaTitle: string (~60 chars), metaDescription: text (~160 chars), ogImage: image (2:1, min 1200×630) }
 
   hero: object
-    heading: string (required)
-    subheading: text
-    cta: object { label: string, url: url }
+    heading: string (required, ~40 chars)
+    subheading: text (~120 chars)
+    backgroundImage: image (16:9, min 1440×810)
+    cta: object { label: string (~20 chars), url: url }
 
-  featuredPosts: array of ref → Post
+  featuredPosts: array of ref → Post (3–6 items)
 ```
 
 **Types:** string, text, richText, image, url, slug, number, boolean, date, datetime, reference, array, object.
 
 For each field: type, required/optional, constraints, relationships.
+
+### Derive constraints from the layout
+
+**Every constraint must come from the design itself.** Don't invent arbitrary limits — only flag what the layout actually enforces or would break without.
+
+| Layout signal | Why it matters | Constraint |
+|--------|------------------|------------|
+| Image has a fixed aspect ratio in the layout | Different ratio would break the composition | `16:9, min 1440×810` |
+| Text sits in a tight container, single line | Overflow would clip or break layout | `max ~40 chars` |
+| Text container is generous, multi-line | Layout tolerates variation | `~120 chars` (soft) |
+| Truncation visible (ellipsis, clipped text) | Design explicitly limits length | `max 60 chars` (hard) |
+| Exactly 3 cards in a row with no "load more" | Layout depends on a specific count | `3 items` |
+| Cards with "load more" / pagination | Layout adapts to variable counts | `3–12 items` |
+
+Prefix with `~` for soft limits (layout is forgiving). Use `max` for hard limits (layout would break).
+
+**Don't add constraints when the layout doesn't care.** A richText body in a full-width section has no meaningful character limit — don't invent one.
+
+### Editor hints (extended mode)
+
+For larger projects or on request, generate a short description per field explaining **why the constraint exists from a layout perspective** — usable as CMS help text:
+
+```
+heading: "Displayed as a single line in large serif. Longer text will overflow the container."
+backgroundImage: "Full-bleed behind the hero section. Must be landscape to fill the 16:9 container."
+cards: "Shown in a 3-column grid. Fewer than 3 leaves visible gaps."
+```
+
+Trigger: the user asks for it, or the page has 5+ content sections. Output as a separate block after the schema.
 
 ## 6. Stress-test
 
@@ -127,10 +189,13 @@ Run before presenting:
 |------|----------|--------|
 | Editor | Field name clear without the design? | Rename |
 | Empty state | Breaks if blank? | Mark required |
-| Overflow | 200 chars in a string? | Note max |
+| Overflow | 200 chars in a string? | Note max, derive from container width |
 | Duplication | Same content in multiple blocks? | Model once |
 | Type precision | Really a `string`? | Could be text, richText, url, slug, number, date |
 | Alt text | Every image has alt? | Add — no exceptions |
+| Image ratio | Does the design enforce an aspect ratio? | Add ratio + min dimensions |
+| Array bounds | Fixed count or flexible? | Add min/max from visible items |
+| Constraints realistic? | Is the derived char limit reasonable? | Cross-check with screenshot — if text looks spacious, the limit is soft (~). If tight/truncated, it's hard (max) |
 
 ## 7. Generate Figma annotations
 
@@ -219,6 +284,16 @@ fieldType.fills = [{ type: 'SOLID', color: { r: 0.55, g: 0.55, b: 0.55 } }]
 fieldType.textAutoResize = 'WIDTH_AND_HEIGHT'
 row.appendChild(fieldType)
 
+// Constraint (optional — append when derived from design metadata)
+// Format: "· ~60 chars" or "· 16:9, min 1440×810"
+const constraint = figma.createText()
+constraint.characters = '· ~60 chars'
+constraint.fontSize = 10
+constraint.fontName = { family: 'Inter', style: 'Regular' }
+constraint.fills = [{ type: 'SOLID', color: { r: 0.70, g: 0.70, b: 0.70 } }]
+constraint.textAutoResize = 'WIDTH_AND_HEIGHT'
+row.appendChild(constraint)
+
 card.appendChild(row)
 row.layoutSizingHorizontal = 'FILL'
 ```
@@ -291,8 +366,12 @@ Update schema and annotations on changes.
 - ALWAYS flag ambiguous elements
 - ALWAYS cross-reference screenshot vs node tree — screenshot is ground truth
 - ALWAYS add alt fields for images
+- ALWAYS place annotations on the same page as the target frame — resolve the frame's parent page via `use_figma` and switch to it with `setCurrentPageAsync` before creating any annotation nodes
+- NEVER call `get_design_context` or `get_screenshot` on nodes you've already fetched — extract all data from the initial response
+- NEVER drill into decorative subtrees — classify from the screenshot and move on
 - Keep field names short, camelCase, readable
 - Don't model layout as content
 - Don't over-nest — flatten 1-2 field objects
 - Don't under-type — use precise types
 - Placeholder text is not structure
+- Batch `use_figma` calls — combine neighbor scanning + page resolution in one script, annotation creation in 2-3 scripts max
