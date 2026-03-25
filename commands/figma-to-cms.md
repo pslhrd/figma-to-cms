@@ -203,8 +203,51 @@ Annotate the design directly in Figma using the Plugin API. Skip this step if wr
 
 ### Process
 
-1. **Read the frame** — get position and dimensions
-2. **Scan for neighboring elements** — before placing any annotations, read ALL top-level children on the page to build a map of occupied space. Check that the intended annotation area (right or left of the target frame) is clear. If other frames/elements occupy both sides, **notify the user** with what's there and ask where they'd like annotations placed. Do not place annotations that would overlap existing design content.
+1. **Resolve the target page (MANDATORY FIRST STEP)** — `use_figma` always starts on Page 1 regardless of which frame you fetched with `get_design_context`. You MUST find the correct page and switch to it before creating any nodes. Combine this with neighbor scanning in a single `use_figma` call:
+
+```js
+// Step 1: Resolve page + scan neighbors — run this BEFORE any annotation creation
+const TARGET_NODE_ID = '84:187'; // the frame's node ID from the URL
+
+// Find which page contains the target frame
+let targetPage = null;
+let targetFrame = null;
+for (const page of figma.root.children) {
+  await figma.setCurrentPageAsync(page);
+  const frame = page.findOne(n => n.id === TARGET_NODE_ID);
+  if (frame) {
+    targetPage = page;
+    targetFrame = frame;
+    break;
+  }
+}
+
+if (!targetPage || !targetFrame) {
+  return { error: 'Target frame not found on any page' };
+}
+
+// Now on the correct page — scan siblings for occupied space
+const siblings = targetPage.children
+  .filter(n => n.id !== targetFrame.id)
+  .map(n => ({ id: n.id, name: n.name, x: n.x, y: n.y, w: n.width, h: n.height }));
+
+return {
+  pageId: targetPage.id,
+  pageName: targetPage.name,
+  frame: { x: targetFrame.x, y: targetFrame.y, w: targetFrame.width, h: targetFrame.height },
+  siblings
+};
+```
+
+Use the returned `pageId` in ALL subsequent `use_figma` calls — start each script with:
+```js
+const page = figma.root.children.find(p => p.id === 'RETURNED_PAGE_ID');
+await figma.setCurrentPageAsync(page);
+```
+
+**Guard:** If the frame is not found on any page, stop and ask the user to re-check the URL.
+
+2. **Check for clear annotation space** — using the sibling map from step 1, verify the intended annotation area (right or left of the target frame) is unoccupied. If other frames/elements occupy both sides, **notify the user** with what's there and ask where they'd like annotations placed. Do not place annotations that would overlap existing design content.
 3. **Place annotation cards** to the right of the frame (120px gap), aligned to each section's Y. **If the content a card describes is positioned on the right side of the design** (x > frame.width * 0.6), place that card on the **left side** instead (x = frame.x - cardWidth - 120) so the connector line is shorter and the association is clearer. Default to right side when content is centered or left-aligned.
 4. **Prevent overlaps + consistent spacing** — after placing each card, track its bottom edge (`card.y + card.height`). The next card's Y = `max(idealY, previousBottom + MIN_GAP)` where `MIN_GAP = 32`. This ensures cards never overlap AND always have at least 32px between them for comfortable readability, even when section Y positions are far apart.
 5. **Draw dashed connector lines** from the nearest frame edge to each card's actual Y — right edge for right-side cards, left edge for left-side cards
@@ -338,21 +381,60 @@ Inter Medium + Regular only. Check available styles before loading — Inter use
 ### Incremental workflow
 
 Don't build all annotations in one script. Split into 2-3 calls:
-1. Legend + first batch of cards (5-6 sections)
-2. Remaining cards + ref doc cards
-3. Validate with a screenshot
+1. **Page resolution + neighbor scan** (step 1 above) — returns `pageId`, frame bounds, siblings
+2. Legend + first batch of cards (5-6 sections) — **must start with `setCurrentPageAsync` using the `pageId` from step 1**
+3. Remaining cards + ref doc cards — **must start with `setCurrentPageAsync` again**
+4. Validate with a screenshot
+
+**Every `use_figma` call that creates annotation nodes MUST begin with:**
+```js
+const page = figma.root.children.find(p => p.id === 'PAGE_ID_FROM_STEP_1');
+await figma.setCurrentPageAsync(page);
+```
+This is non-negotiable — `use_figma` resets to Page 1 on every invocation.
 
 Return all created node IDs from each call.
 
-## 8. Validate with user
+## 8. Detect existing CMS setup
 
-Present schema + annotations, then ask:
+Before asking the user what to generate, scan the project for an existing CMS. Run these checks **in parallel** (file glob + grep — no need for sequential calls):
 
+| Signal | Files to check | CMS detected |
+|--------|---------------|--------------|
+| Sanity | `sanity.config.{ts,js}`, `sanity.cli.{ts,js}`, `schemas/**/*.{ts,js}` | Sanity v3 |
+| Contentful | `contentful-migration/**`, `.contentful.json`, `contentful.config.{ts,js}` | Contentful |
+| Prismic | `prismicio.{ts,js}`, `slicemachine.config.json`, `customtypes/**` | Prismic |
+| DatoCMS | `datocms.config.{ts,js}`, `migrations/**/*.{ts,js}` with `client.itemTypes` | DatoCMS |
+| Kirby | `site/blueprints/**/*.yml`, `site/models/**/*.php` | Kirby |
+| Strapi | `src/api/**/content-types/**/*.json`, `config/database.{ts,js}` | Strapi |
+| WordPress | `wp-content/themes/**/functions.php`, `acf-json/**` | WordPress / ACF |
+| Payload | `payload.config.{ts,js}`, `collections/**/*.{ts,js}` | Payload CMS |
+
+Also check `package.json` (if it exists) for CMS SDK dependencies: `sanity`, `contentful`, `@prismicio/client`, `datocms-client`, `payload`, `@strapi/strapi`.
+
+### If a CMS is detected
+
+Report what you found and scan the existing schema files to understand:
+- **Document types** already defined — list them by name
+- **Naming conventions** — camelCase vs snake_case, field prefixes, how references are modeled
+- **Shared patterns** — reusable objects (e.g., SEO, CTA, image with alt), validation rules, custom types
+- **Existing referenced documents** that the new schema might link to (e.g., a `category` or `author` type already exists)
+
+Then ask the user:
+> "I found an existing **[CMS name]** setup with these document types: [list]. Do you want me to extend this setup with the new schema? I'll match the existing conventions and reuse [shared types found]."
+
+If yes, generate code that integrates with the existing setup — import shared types, follow naming conventions, place files in the established directory structure.
+
+### If no CMS is detected
+
+Present the schema and annotations, then ask:
 1. Block structure correct?
 2. Field types correct?
 3. Anything missing?
 4. Grey-area items to resolve?
-**Guard:** Wait for answers. Always generate Figma annotations immediately after proposing the schema — do not wait for validation to annotate.
+5. **What CMS are you targeting?** (Sanity, Contentful, Prismic, Kirby, DatoCMS, or other?)
+
+**Guard:** Wait for answers. Do not generate CMS code until the user confirms the schema and specifies a target. Always generate Figma annotations immediately after proposing the schema — do not wait for validation to annotate.
 
 ## 9. Iterate
 
@@ -366,7 +448,7 @@ Update schema and annotations on changes.
 - ALWAYS flag ambiguous elements
 - ALWAYS cross-reference screenshot vs node tree — screenshot is ground truth
 - ALWAYS add alt fields for images
-- ALWAYS place annotations on the same page as the target frame — resolve the frame's parent page via `use_figma` and switch to it with `setCurrentPageAsync` before creating any annotation nodes
+- ALWAYS resolve the target frame's page in a dedicated `use_figma` call BEFORE creating any annotations. `use_figma` resets to Page 1 on every invocation — you must call `setCurrentPageAsync` at the start of EVERY script that creates nodes. Failure to do this will silently place annotations on the wrong page
 - NEVER call `get_design_context` or `get_screenshot` on nodes you've already fetched — extract all data from the initial response
 - NEVER drill into decorative subtrees — classify from the screenshot and move on
 - Keep field names short, camelCase, readable
