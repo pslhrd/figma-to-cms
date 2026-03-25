@@ -1,5 +1,7 @@
 # figma-to-cms
 
+![figma-to-cms](cover.png)
+
 A Claude Code command that analyzes a Figma design frame, classifies content vs decoration (layout agnostic), and proposes a CMS-ready schema. Leverages `use_figma` to annotate the design directly — schema cards sit right next to the frame for instant visual review.
 
 Output is platform-agnostic, ready for any CMS.
